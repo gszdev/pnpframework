@@ -1,10 +1,12 @@
 ﻿using Microsoft.SharePoint.Client;
 using PnP.Framework.Diagnostics;
+using PnP.Framework.Extensions;
 using PnP.Framework.Provisioning.Model;
 using PnP.Framework.Provisioning.ObjectHandlers.Extensions;
 using PnP.Framework.Provisioning.ObjectHandlers.Utilities;
 using PnP.Framework.Utilities;
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -272,7 +274,26 @@ namespace PnP.Framework.Provisioning.ObjectHandlers
                           f => f.DefaultValue,
                           f => f.Required))
                   );
+
+                web.Context.Load(web,
+                    w => w.AssociatedOwnerGroup,
+                    w => w.AssociatedMemberGroup,
+                    w => w.AssociatedVisitorGroup,
+                    w => w.Title,
+                    w => w.Url,
+                    w => w.RoleDefinitions.Include(r => r.RoleTypeKind, r => r.Name),
+                    w => w.ContentTypes.Include(c => c.Id, c => c.Name, c => c.StringId));
+
                 web.Context.ExecuteQueryRetry();
+
+                if (web.IsSubSite())
+                {
+                    var siteCollectionContext = web.ParentWeb.Context as ClientContext;
+                    siteCollectionContext.Site.RootWeb.EnsureProperties(
+                        w => w.ServerRelativeUrl,
+                        w => w.Url,
+                        w => w.ContentTypes.Include(c => c.Id, c => c.Name, c => c.StringId));
+                }
 
                 var allLists = new List<List>();
 
@@ -538,7 +559,7 @@ namespace PnP.Framework.Provisioning.ObjectHandlers
                 addFile = true;
             }
 
-            ExtractFileSettings(web, siteList, myFile.UniqueId, ref newFile, defaultContentTypeId, scope);
+            ExtractFileSettings(web, siteList, myFile.UniqueId, ref newFile, defaultContentTypeId, scope, listItem);
 
             if (addFile && creationInfo.PersistBrandingFiles)
             {
@@ -555,7 +576,7 @@ namespace PnP.Framework.Provisioning.ObjectHandlers
             }
         }
 
-        private void ExtractFileSettings(Web web, List siteList, Guid fileUniqueId, ref Model.File pnpFile, string defaultContentTypeId, PnPMonitoredScope scope)
+        private void ExtractFileSettings(Web web, List siteList, Guid fileUniqueId, ref Model.File pnpFile, string defaultContentTypeId, PnPMonitoredScope scope, ListItem listItem)
         {
             try
             {
@@ -565,6 +586,7 @@ namespace PnP.Framework.Provisioning.ObjectHandlers
                     f => f.ServerRelativePath,
                     f => f.Properties,
                     f => f.ListItemAllFields,
+                    f => f.ListItemAllFields.FieldValuesAsText,
                     f => f.ListItemAllFields.RoleAssignments,
                     f => f.ListItemAllFields.RoleAssignments.Include(r => r.Member, r => r.RoleDefinitionBindings),
                     f => f.ListItemAllFields.HasUniqueRoleAssignments,
@@ -577,18 +599,15 @@ namespace PnP.Framework.Provisioning.ObjectHandlers
                 if (web.IsSubSite())
                 {
                     siteCollectionContext = web.ParentWeb.Context as ClientContext;
-                    siteCollectionContext.Site.RootWeb.EnsureProperties(
-                        w => w.ServerRelativeUrl,
-                        w => w.Url,
-                        w => w.ContentTypes.Include(c => c.Id, c => c.Name, c => c.StringId));
                 }
 
                 //export PnPFile FieldValues
                 if (file.ListItemAllFields.FieldValues.Any())
                 {
                     var fieldValues = file.ListItemAllFields.FieldValues;
-
                     var fieldValuesAsText = file.ListItemAllFields.EnsureProperty(li => li.FieldValuesAsText).FieldValues;
+                    //var fieldValues = listItem.FieldValues;
+                    //var fieldValuesAsText = listItem.FieldValuesAsText.FieldValues;
 
                     if (file.ListItemAllFields.ContentType.StringId != defaultContentTypeId) // skip if it is the default content type (don't run through loops if not needed)
                     {
@@ -622,35 +641,59 @@ namespace PnP.Framework.Provisioning.ObjectHandlers
                         #endregion //**** get correct Content Type
                     }
 
-                    foreach (var fieldValue in fieldValues)
+                    var propertiesDict = new ConcurrentDictionary<string, string>();
+
+                    if (fieldValues.Count > 100)
                     {
-                        if (fieldValue.Value != null && !string.IsNullOrEmpty(fieldValue.Value.ToString()))
+                        System.Threading.Tasks.Parallel.ForEach(fieldValues, fieldValue =>
                         {
-                            var field = siteList.Fields.FirstOrDefault(fs => fs.InternalName == fieldValue.Key);
-                            string value = string.Empty;
-                            //ignore read only fields
-                            if (!field.ReadOnlyField || WriteableReadOnlyField.Contains(field.InternalName.ToLower()))
-                            {
-                                value = TokenizeValue(web, field.TypeAsString, fieldValue, fieldValuesAsText[field.InternalName]);
-
-                                if (fieldValue.Key == "ContentTypeId" && fieldValue.Key == "Attachments")
-                                {
-                                    value = null; //it's already in Properties - we can ignore here
-                                }
-                            }
-
-                            // We process real values only
-                            if (value != null && !String.IsNullOrEmpty(value) && value != "[]")
-                            {
-                                pnpFile.Properties[fieldValue.Key] = value;
-                            }
+                            FillFileProperties(web, siteList, fieldValuesAsText, propertiesDict, fieldValue);
+                        });
+                    }
+                    else
+                    {
+                        foreach (var fieldValue in fieldValues)
+                        {
+                            FillFileProperties(web, siteList, fieldValuesAsText, propertiesDict, fieldValue);
                         }
                     }
+
+                    foreach (var kvp in propertiesDict)
+                    {
+                        pnpFile.Properties[kvp.Key] = kvp.Value;
+                    }
+                    
                 }
             }
             catch (Exception ex)
             {
                 scope.LogError(ex, "Extract of File with uniqueId {0} failed", fileUniqueId);
+            }
+
+            void FillFileProperties(Web web, List siteList, Dictionary<string, string> fieldValuesAsText, ConcurrentDictionary<string, string> propertiesDict, KeyValuePair<string, object> fieldValue)
+            {
+                if (fieldValue.Value != null && !string.IsNullOrEmpty(fieldValue.Value.ToString()))
+                {
+                    var field = siteList.Fields.FirstOrDefault(fs => fs.InternalName == fieldValue.Key);
+                    string value = string.Empty;
+                    //ignore read only fields
+                    if (!field.ReadOnlyField || WriteableReadOnlyField.Contains(field.InternalName.ToLower()))
+                    {
+                        value = TokenizeValue(web, field.TypeAsString, fieldValue, fieldValuesAsText[field.InternalName]);
+
+                        if (fieldValue.Key == "ContentTypeId" && fieldValue.Key == "Attachments")
+                        {
+                            value = null; //it's already in Properties - we can ignore here
+                        }
+                    }
+
+                    // We process real values only
+                    if (value != null && !String.IsNullOrEmpty(value) && value != "[]")
+                    {
+
+                        propertiesDict.AddOrUpdate(fieldValue.Key, value, (k, v) => propertiesDict[k] = v);
+                    }
+                }
             }
         }
 
@@ -746,7 +789,13 @@ namespace PnP.Framework.Provisioning.ObjectHandlers
             return value;
         }
 
-        public Model.Folder ExtractFolderSettings(Web web, List siteList, List<Dictionary<string, string>> listDefaultValues, string serverRelativePathToFolder, PnPMonitoredScope scope, Model.Configuration.Lists.Lists.ExtractListsQueryConfiguration queryConfig)
+        public Model.Folder ExtractFolderSettings(
+            Web web, 
+            List siteList, 
+            List<Dictionary<string, string>> listDefaultValues, 
+            string serverRelativePathToFolder, PnPMonitoredScope scope, 
+            Model.Configuration.Lists.Lists.ExtractListsQueryConfiguration queryConfig,
+            ListItem listItem)
         {
             Model.Folder pnpFolder = null;
             try
@@ -757,13 +806,13 @@ namespace PnP.Framework.Provisioning.ObjectHandlers
                     f => f.ServerRelativeUrl,
                     f => f.Properties,
                     f => f.ListItemAllFields,
+                    f => f.ListItemAllFields.FieldValuesAsText,
                     f => f.ListItemAllFields.RoleAssignments,
                     f => f.ListItemAllFields.RoleAssignments.Include(r => r.Member, r => r.RoleDefinitionBindings),
                     f => f.ListItemAllFields.HasUniqueRoleAssignments,
                     f => f.ListItemAllFields.ParentList,
                     f => f.ListItemAllFields.ContentType.StringId);
 
-                web.Context.ExecuteQueryRetry();
                 /*
                 web.Context.Load(web,
                     w => w.AssociatedOwnerGroup,
@@ -772,29 +821,14 @@ namespace PnP.Framework.Provisioning.ObjectHandlers
                     w => w.Title,
                     w => w.Url,
                     w => w.RoleDefinitions.Include(r => r.RoleTypeKind, r => r.Name),
-                    w => w.ContentTypes.Include(c => c.Id, c => c.Name, c => c.StringId));
-                web.Context.ExecuteQueryRetry();
+                    w => w.ContentTypes.Include(c => c.Id, c => c.Name, c => c.StringId));                
                 */
-
-                web.EnsureProperties(
-                    w => w.AssociatedOwnerGroup,
-                    w => w.AssociatedMemberGroup,
-                    w => w.AssociatedVisitorGroup,
-                    w => w.Title,
-                    w => w.Url,
-                    w => w.RoleDefinitions.Include(r => r.RoleTypeKind, r => r.Name),
-                    w => w.ContentTypes.Include(c => c.Id, c => c.Name, c => c.StringId));
-
+                web.Context.ExecuteQueryRetry();
                 ClientContext siteCollectionContext = null;
                 if (web.IsSubSite())
                 {
                     siteCollectionContext = web.ParentWeb.Context as ClientContext;
-                    siteCollectionContext.Site.RootWeb.EnsureProperties(
-                        w => w.ServerRelativeUrl,
-                        w => w.Url,
-                        w => w.ContentTypes.Include(c => c.Id, c => c.Name, c => c.StringId));
                 }
-
 
                 pnpFolder = new Model.Folder(spFolder.Name);
 
@@ -813,13 +847,16 @@ namespace PnP.Framework.Provisioning.ObjectHandlers
                 {
                     var list = spFolder.ListItemAllFields.ParentList;
 
-                    var fields = list.Fields;
-                    web.Context.Load(fields, fs => fs.IncludeWithDefaultProperties(f => f.TypeAsString, f => f.InternalName, f => f.Title));
-                    web.Context.ExecuteQueryRetry();
+                    //var fields = list.Fields;
+                    //web.Context.Load(fields, fs => fs.IncludeWithDefaultProperties(f => f.TypeAsString, f => f.InternalName, f => f.Title));
+                    //web.Context.ExecuteQueryRetry();
 
                     var fieldValues = spFolder.ListItemAllFields.FieldValues;
-
                     var fieldValuesAsText = spFolder.ListItemAllFields.EnsureProperty(li => li.FieldValuesAsText).FieldValues;
+
+                    //var list = listItem.ParentList;
+                    //var fieldValues = listItem.FieldValues;
+                    //var fieldValuesAsText = listItem.FieldValuesAsText.FieldValues;
 
                     #region //**** get correct Content Type
                     string ctId = string.Empty;
@@ -854,45 +891,23 @@ namespace PnP.Framework.Provisioning.ObjectHandlers
                         filteredFieldValues = fieldValues.Where(f => queryConfig.ViewFields.Contains(f.Key)).ToList();
                     }
 
-                    foreach (var fieldValue in filteredFieldValues)
+                    var propertiesDict = new ConcurrentDictionary<string, string>();
+                    if (filteredFieldValues.Count > 100)
                     {
-                        if (fieldValue.Value != null && !string.IsNullOrEmpty(fieldValue.Value.ToString()))
+                        System.Threading.Tasks.Parallel.ForEach(filteredFieldValues, fieldValue =>
                         {
-                            var field = siteList.Fields.FirstOrDefault(fs => fs.InternalName == fieldValue.Key);
-                            string value = string.Empty;
-
-                            //ignore read only fields
-                            if (!field.ReadOnlyField || WriteableReadOnlyField.Contains(field.InternalName.ToLower()))
-                            {
-                                value = TokenizeValue(web, field.TypeAsString, fieldValue, fieldValuesAsText[field.InternalName]);
-                            }
-
-                            //We process moderation status, ideally this shoud be managed with a new attribute in Folder, but it requires a new schema version
-                            if (fieldValue.Key.Equals("_ModerationStatus", StringComparison.InvariantCultureIgnoreCase))
-                            {
-                                value = TokenizeValue(web, field.TypeAsString, fieldValue, fieldValuesAsText[field.InternalName]);
-                            }
-
-                            if (fieldValue.Key.Equals("ContentTypeId", StringComparison.InvariantCultureIgnoreCase) || fieldValue.Key.Equals("Attachments", StringComparison.InvariantCultureIgnoreCase))
-                            {
-                                value = null; //ignore here since already in dataRow
-                            }
-
-                            if (fieldValue.Key.Equals("HTML_x0020_File_x0020_Type", StringComparison.CurrentCultureIgnoreCase) &&
-                                fieldValuesAsText["HTML_x0020_File_x0020_Type"] == "OneNote.Notebook")
-                            {
-                                pnpFolder.Properties.Add("File_x0020_Type", "OneNote.Notebook");
-                                pnpFolder.Properties.Add(fieldValue.Key, "OneNote.Notebook");
-                                value = null;
-                            }
-
-                            // We process real values only
-                            if (!string.IsNullOrWhiteSpace(value) && value != "[]")
-                            {
-                                pnpFolder.Properties.Add(fieldValue.Key, value);
-                            }
+                            FillFolderProperties(web, siteList, fieldValuesAsText, propertiesDict, fieldValue);
+                        });
+                    }
+                    else
+                    {
+                        foreach (var fieldValue in filteredFieldValues)
+                        {
+                            FillFolderProperties(web, siteList, fieldValuesAsText, propertiesDict, fieldValue);
                         }
                     }
+
+                    pnpFolder.Properties.AddRange(propertiesDict);
                 }
 
                 //export PnPFolder default values
@@ -913,6 +928,49 @@ namespace PnP.Framework.Provisioning.ObjectHandlers
                 scope.LogError(ex, "Extract of Folder {0} failed", serverRelativePathToFolder);
             }
             return pnpFolder;
+
+            void FillFolderProperties(Web web, List siteList, Dictionary<string, string> fieldValuesAsText, ConcurrentDictionary<string, string> propertiesDict, KeyValuePair<string, object> fieldValue)
+            {
+                if (fieldValue.Value != null && !string.IsNullOrEmpty(fieldValue.Value.ToString()))
+                {
+                    var field = siteList.Fields.FirstOrDefault(fs => fs.InternalName == fieldValue.Key);
+                    string value = string.Empty;
+
+                    //ignore read only fields
+                    if (!field.ReadOnlyField || WriteableReadOnlyField.Contains(field.InternalName.ToLower()))
+                    {
+                        value = TokenizeValue(web, field.TypeAsString, fieldValue, fieldValuesAsText[field.InternalName]);
+                    }
+
+                    //We process moderation status, ideally this shoud be managed with a new attribute in Folder, but it requires a new schema version
+                    if (fieldValue.Key.Equals("_ModerationStatus", StringComparison.InvariantCultureIgnoreCase))
+                    {
+                        value = TokenizeValue(web, field.TypeAsString, fieldValue, fieldValuesAsText[field.InternalName]);
+                    }
+
+                    if (fieldValue.Key.Equals("ContentTypeId", StringComparison.InvariantCultureIgnoreCase) || fieldValue.Key.Equals("Attachments", StringComparison.InvariantCultureIgnoreCase))
+                    {
+                        value = null; //ignore here since already in dataRow
+                    }
+
+                    if (fieldValue.Key.Equals("HTML_x0020_File_x0020_Type", StringComparison.CurrentCultureIgnoreCase) &&
+                        fieldValuesAsText["HTML_x0020_File_x0020_Type"] == "OneNote.Notebook")
+                    {
+                        //pnpFolder.Properties.Add("File_x0020_Type", "OneNote.Notebook");
+                        //pnpFolder.Properties.Add(fieldValue.Key, "OneNote.Notebook");
+                        propertiesDict.TryAdd("File_x0020_Type", "OneNote.Notebook");
+                        propertiesDict.TryAdd(fieldValue.Key, "OneNote.Notebook");                        
+                        value = null;
+                    }
+
+                    // We process real values only
+                    if (!string.IsNullOrWhiteSpace(value) && value != "[]")
+                    {
+                        propertiesDict.TryAdd(fieldValue.Key, value);
+                        //pnpFolder.Properties.Add(fieldValue.Key, value);
+                    }
+                }
+            }
         }
 
         private void ProcessFolderRow(Web web, ListItem listItem, List siteList, ListInstance listInstance, Model.Configuration.Lists.Lists.ExtractListsQueryConfiguration queryConfig, List<Dictionary<string, string>> listDefaultValues, ProvisioningTemplate template, PnPMonitoredScope scope)
@@ -934,7 +992,7 @@ namespace PnP.Framework.Provisioning.ObjectHandlers
                         if (pnpFolder == null)
                         {
                             string pathToCurrentFolder = string.Format("{0}/{1}", serverRelativeListUrl, string.Join("/", folderSegments.Take(i + 1)));
-                            pnpFolder = ExtractFolderSettings(web, siteList, listDefaultValues, pathToCurrentFolder, scope, queryConfig);
+                            pnpFolder = ExtractFolderSettings(web, siteList, listDefaultValues, pathToCurrentFolder, scope, queryConfig, listItem);
                             listInstance.Folders.Add(pnpFolder);
                         }
                     }
@@ -944,7 +1002,7 @@ namespace PnP.Framework.Provisioning.ObjectHandlers
                         if (childFolder == null)
                         {
                             string pathToCurrentFolder = string.Format("{0}/{1}", serverRelativeListUrl, string.Join("/", folderSegments.Take(i + 1)));
-                            childFolder = ExtractFolderSettings(web, siteList, listDefaultValues, pathToCurrentFolder, scope, queryConfig);
+                            childFolder = ExtractFolderSettings(web, siteList, listDefaultValues, pathToCurrentFolder, scope, queryConfig, listItem);
                             pnpFolder.Folders.Add(childFolder);
                         }
                         pnpFolder = childFolder;
